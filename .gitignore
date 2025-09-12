@@ -1,0 +1,64 @@
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+venv/
+.env
+.python-version
+
+# Logs / temp
+*.log
+*.tmp
+tmp/
+
+# Caches
+.cache/
+cache/
+
+# Models / large weights (keep directory, ignore large binaries)
+models/**
+!models/.gitkeep
+loras/**
+!loras/.gitkeep
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+
+# Old exports / archives
+old/
+
+# Node (for extension package.json if npm used later)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Coverage / test artifacts
+htmlcov/
+.coverage*
+coverage.xml
+
+# Generated images
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Misc
+*.swp
+*.orig
+*.bak
