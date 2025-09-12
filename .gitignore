@@ -20,6 +20,9 @@ venv/
 .env
 .python-version
 
+# Development artifacts
+.dev-mode
+
 # Logs / temp
 *.log
 *.tmp

@@ -1,0 +1,25 @@
+{
+    "name": "pixelai-development",
+    "version": "1.0.0",
+    "description": "Development tools for PixelAI Aseprite Extension",
+    "scripts": {
+        "build": "./scripts/build.sh",
+        "build:verbose": "./scripts/build.sh --verbose",
+        "dev:sync": "./scripts/dev-sync.sh",
+        "start:server": "./start_server.sh"
+    },
+    "devDependencies": {},
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Apofenic/PixelAI_macport"
+    },
+    "keywords": [
+        "aseprite",
+        "extension",
+        "pixel-art",
+        "ai",
+        "stable-diffusion"
+    ],
+    "author": "RED",
+    "license": "MIT"
+}
