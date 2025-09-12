@@ -40,7 +40,8 @@ loras/**
 *.bin
 
 # Old exports / archives
-old/
+old-builds/
+original-windows-files/
 
 # Node (for extension package.json if npm used later)
 node_modules/
