@@ -1,9 +1,47 @@
--- Local AI Generator for Aseprite - Enhanced UI Version
--- Professional pixel art generation using Stable Diffusion
--- (Debug note) Removed prior intentional error to allow UI to load while we surface path info.
+--[[
+PixelAI Extension - Main UI and Core Logic
+==========================================
+
+This is the main functionality file for the PixelAI Aseprite extension. It provides
+a comprehensive interface for generating AI-powered pixel art using Stable Diffusion
+models running on a local Python server.
+
+Features:
+- Professional UI with presets and real-time feedback
+- Support for multiple AI models and LoRA adapters
+- Configurable generation parameters (size, steps, guidance, etc.)
+- Background removal and color quantization
+- Multiple output methods (new layer, new frame)
+- Preset management for common use cases
+- Real-time server status monitoring
+
+Architecture:
+- Modular design with separate HTTP client, JSON, and Base64 utilities
+- Asynchronous generation with progress feedback
+- Safe error handling throughout the pipeline
+- Configurable quality presets for different use cases
+
+Dependencies:
+- json.lua: JSON encoding/decoding
+- base64.lua: Base64 encoding/decoding for image data
+- http-client.lua: HTTP communication with Python server
+--]]
+
+-- ============================================================================
+-- INITIALIZATION AND MODULE LOADING
+-- ============================================================================
+
+-- Determine script directory for loading dependencies
 local script_path = debug.getinfo(1, "S").source:sub(2)
 local script_dir = script_path:match("(.*)[/\\]")
 
+--[[
+Safe module loading function with error handling
+Loads required Lua modules and handles failures gracefully
+
+@param filename: Name of the Lua file to load
+@return: Loaded module or nil on failure
+--]]
 local function safe_dofile(filename)
     local full_path = script_dir .. "/" .. filename
     local success, result = pcall(dofile, full_path)
@@ -14,26 +52,37 @@ local function safe_dofile(filename)
     return result
 end
 
--- Load required libraries
+-- Load required libraries with error checking
 local json = safe_dofile("json.lua")
 local base64 = safe_dofile("base64.lua") 
 local http_client = safe_dofile("http-client.lua")
 
+-- Ensure all dependencies loaded successfully
 if not json or not base64 or not http_client then 
     app.alert("Failed to load required libraries. Please ensure all files are in the same directory.")
     return 
 end
 
--- Plugin configuration
+-- ============================================================================
+-- CONFIGURATION AND CONSTANTS
+-- ============================================================================
+
+-- Plugin configuration - modify these settings as needed
 local plugin_config = {
-    server_url = "http://127.0.0.1:5000",
-    name = "Local AI Generator v2.0",
-    version = "2.0.0"
+    server_url = "http://127.0.0.1:5000",  -- Local Python server address
+    name = "Local AI Generator v2.0",       -- Display name
+    version = "2.0.0"                      -- Version identifier
 }
 
--- DEBUG: capture script dir fingerprint so user can verify which copy is running without console
+-- Debug information for development and troubleshooting
 local debug_fingerprint = (script_dir or "?")
     :gsub(os.getenv("HOME") or "", "~")
+
+--[[
+Shortens long paths for display in debug messages
+@param p: Path string to shorten
+@return: Shortened path with ellipsis if needed
+--]]
 local function short_path(p)
     if #p > 48 then
         return "…" .. p:sub(-47)
@@ -41,42 +90,50 @@ local function short_path(p)
     return p
 end
 
--- Global state
-local is_generating = false
-local current_dialog = nil
-local available_models = {}
-local available_loras = {}
-local lora_value_by_label = {}
-local lora_label_by_value = {}
-local server_status = "Unknown"
-local last_generation_time = 0
-local current_engine = "torch" -- 'torch' or 'mlx'
+-- ============================================================================
+-- GLOBAL STATE MANAGEMENT
+-- ============================================================================
 
--- Enhanced default settings with better defaults for pixel art
+-- Generation state tracking
+local is_generating = false              -- Prevents concurrent generations
+local current_dialog = nil              -- Reference to active dialog
+local available_models = {}             -- Models available on server
+local available_loras = {}              -- LoRA models with compatibility info
+local lora_value_by_label = {}          -- Maps display labels to actual values
+local lora_label_by_value = {}          -- Maps actual values to display labels
+local server_status = "Unknown"         -- Current server connection status
+local last_generation_time = 0          -- Duration of last generation
+local current_engine = "torch"          -- AI engine type ('torch' or 'mlx')
+
+-- ============================================================================
+-- DEFAULT SETTINGS AND PRESETS
+-- ============================================================================
+
+-- Enhanced default settings optimized for pixel art generation
 local default_settings = {
     prompt = "pixel art, cute character, 16-bit style, vibrant colors",
     negative_prompt = "blurry, smooth, antialiased, realistic, photographic, 3d render, low quality",
-    pixel_width = 64,
-    pixel_height = 64,
-    steps = 25,
-    guidance_scale = 7.5,
-    colors = 16,
-    seed = -1,
-    remove_background = false,
-    model_name = "stabilityai/stable-diffusion-xl-base-1.0",
-    lora_model = "nerijs/pixel-art-xl",
-    lora_strength = 0.8,
-    output_method = "New Layer",
-    generation_quality = "High (1024x1024)"
+    pixel_width = 64,                    -- Final pixel art width
+    pixel_height = 64,                   -- Final pixel art height
+    steps = 15,                          -- Diffusion steps (quality vs speed)
+    guidance_scale = 7.5,                -- How closely to follow prompt
+    colors = 16,                         -- Color palette size for quantization
+    seed = -1,                           -- Random seed (-1 for random)
+    remove_background = false,           -- Transparent background option
+    model_name = "stabilityai/stable-diffusion-xl-base-1.0",  -- Base model
+    lora_model = "nerijs/pixel-art-xl",  -- LoRA adapter for pixel art
+    lora_strength = 0.8,                 -- LoRA influence strength
+    output_method = "New Layer",         -- Where to place generated image
+    generation_quality = "High (1024x1024)"  -- Base generation resolution
 }
 
--- Current settings (copy of defaults)
+-- Current active settings (copy of defaults)
 local current_settings = {}
 for k, v in pairs(default_settings) do 
     current_settings[k] = v 
 end
 
--- Preset prompts for quick access
+-- Preset prompts for quick access and inspiration
 local preset_prompts = {
     "pixel art, cute animal, simple design, flat colors",
     "pixel art, fantasy character, rpg style, detailed sprite",
@@ -89,6 +146,7 @@ local preset_prompts = {
 }
 
 -- Quality presets for base generation resolution
+-- Higher resolutions produce better quality but take longer to generate
 local quality_presets = {
     {name = "Fast (512x512)", width = 512, height = 512, description = "Faster generation"},
     {name = "High (1024x1024)", width = 1024, height = 1024, description = "Better quality (default)"},
@@ -96,17 +154,27 @@ local quality_presets = {
     {name = "Max (2048x2048)", width = 2048, height = 2048, description = "Maximum quality (very slow)"}
 }
 
--- Common dimension presets
+-- Common dimension presets for pixel art
 local dimension_presets = {
     {name = "Tiny (32x32)", width = 32, height = 32},
     {name = "Small (64x64)", width = 64, height = 64},
     {name = "Medium (128x128)", width = 128, height = 128},
     {name = "Large (256x256)", width = 256, height = 256},
     {name = "Portrait (64x96)", width = 64, height = 96},
-    {name = "Landscape (96x64)", width = 96, height = 64}
+    {name = "Landscape (96x64)", width = 96, height = 64},
+    {name = "Neo Geo (320x224)", width = 320, height = 224},
+    {name = "Neo Geo 16x9 (400x224)", width = 400, height = 224},
 }
 
--- Utility functions
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+--[[
+Formats time duration for user display
+@param seconds: Time duration in seconds
+@return: Formatted string (e.g., "1.5s" or "2.3m")
+--]]
 local function format_time(seconds)
     if seconds < 60 then
         return string.format("%.1fs", seconds)
@@ -115,18 +183,29 @@ local function format_time(seconds)
     end
 end
 
+--[[
+Prepares Aseprite canvas for AI-generated image placement
+Creates new layer and optionally new frame based on output method
+
+@param output_method: Where to place image ("New Layer" or "New Frame")
+@param image_mode: Color mode for the image (RGBA or RGB)
+@return: Created cel object for image placement
+--]]
 local function prepare_image_for_generation(output_method, image_mode)
+    -- Clear any active selection to avoid placement issues
     if not app.activeSprite.selection.isEmpty then 
         app.command.Cancel() 
     end
     
     local cel
     app.transaction("AI Generation Setup", function()
+        -- Create timestamped layer name for organization
         local timestamp = os.date("%H:%M:%S")
         local layer_name = "AI Gen " .. timestamp
         local layer = app.activeSprite:newLayer{name = layer_name, colorMode = image_mode}
         app.activeLayer = layer
         
+        -- Handle frame creation based on output method
         local frame
         if output_method == "New Frame" then
             frame = app.activeSprite:newEmptyFrame(app.activeFrame.frameNumber + 1)
@@ -139,9 +218,16 @@ local function prepare_image_for_generation(output_method, image_mode)
     return cel
 end
 
+--[[
+Fetches available models and LoRAs from the server
+Updates global state and calls callback when complete
+
+@param callback: Function to call when data is loaded (optional)
+--]]
 local function fetch_models_and_loras(callback)
     server_status = "Connecting..."
     
+    -- Fetch available models
     http_client.get(plugin_config.server_url .. "/models", function(res, err)
         if res and res.models then
             available_models = res.models
@@ -149,16 +235,23 @@ local function fetch_models_and_loras(callback)
             available_models = {"Connection Failed"}
         end
         
+        -- Fetch available LoRAs with compatibility information
         http_client.get(plugin_config.server_url .. "/loras", function(res2, err2)
-            -- rebuild lists with compatibility labels
+            -- Rebuild LoRA lists with compatibility labels
             available_loras = {}
             lora_value_by_label = {}
             lora_label_by_value = {}
+            
             if res2 and res2.loras then
+                -- Build compatibility lookup table
                 local compat = {}
                 if res2.compatible_loras then
-                    for _,v in ipairs(res2.compatible_loras) do compat[v] = true end
+                    for _,v in ipairs(res2.compatible_loras) do 
+                        compat[v] = true 
+                    end
                 end
+                
+                -- Process each LoRA with compatibility marking
                 for _,v in ipairs(res2.loras) do
                     local label = v
                     if v ~= "None" and not compat[v] then
@@ -172,7 +265,7 @@ local function fetch_models_and_loras(callback)
                 available_loras = {"Connection Failed"}
             end
             
-            -- Check server health
+            -- Check server health and get engine information
             http_client.get(plugin_config.server_url .. "/health", function(health_res, health_err)
                 if health_res then
                     current_engine = health_res.engine or current_engine
@@ -190,7 +283,46 @@ local function fetch_models_and_loras(callback)
     end)
 end
 
+--[[
+Initiates AI image generation with the provided settings
+Sends request to Python server and handles response
+
+This function is the core of the AI generation pipeline. It:
+1. Prevents concurrent generations to avoid server overload
+2. Extracts base resolution from quality presets (512x512 to 2048x2048)
+3. Builds a comprehensive request payload with all generation parameters
+4. Sends HTTP POST request to the Python AI server
+5. Tracks generation timing for user feedback
+6. Calls back with results for UI handling and image placement
+
+The function handles two key resolution concepts:
+- Base resolution: High-res generation (1024x1024+) for quality AI output
+- Final pixel art size: Target dimensions (32x32 to 256x256) after quantization
+
+Generation flow:
+- Server generates high-resolution image using Stable Diffusion
+- Server automatically downscales and quantizes to pixel art specifications  
+- Result is returned as Base64-encoded image data for Aseprite placement
+
+@param settings: Table containing all generation parameters:
+  - prompt: Text description for AI generation
+  - negative_prompt: What to avoid in generation
+  - pixel_width/pixel_height: Final pixel art dimensions
+  - steps: Quality vs speed tradeoff (10-50)
+  - guidance_scale: How closely to follow prompt (1-20)
+  - colors: Palette size for quantization (8-64)
+  - seed: Reproducible generation (-1 for random)
+  - lora_model: Style adapter model name
+  - lora_strength: Style influence (0.0-2.0)
+  - remove_background: Transparent background option
+  - generation_quality: Base resolution preset
+
+@param callback: Function called with (response, error) when generation completes
+  - Success: response.success=true, response.image contains Base64 data
+  - Failure: error contains descriptive message, response may have error codes
+--]]
 local function generate_image(settings, callback)
+    -- Prevent concurrent generations
     if is_generating then 
         app.alert("Generation already in progress. Please wait...")
         return 
@@ -241,6 +373,42 @@ local function generate_image(settings, callback)
     end)
 end
 
+--[[
+Places AI-generated image data into Aseprite canvas
+Handles the final step of the AI generation pipeline by converting Base64 image data
+into an Aseprite Image object and placing it on the canvas
+
+This function is the bridge between the AI server's output and Aseprite's native image format.
+It handles several critical tasks:
+
+1. **Color Mode Detection**: Determines if image has transparency (RGBA) or not (RGB)
+2. **Canvas Management**: Creates new sprite if none exists, preserves existing workspace
+3. **Layer/Frame Setup**: Uses prepare_image_for_generation() to create proper placement target
+4. **Data Conversion**: Decodes Base64 image data back to raw pixel bytes
+5. **Safe Image Creation**: Uses error handling for image byte assignment (can fail with corrupted data)
+6. **Canvas Integration**: Places image at origin (0,0) and refreshes Aseprite display
+
+Image Data Pipeline:
+- AI Server: Generates pixel art → encodes as Base64 → sends via JSON
+- This Function: Decodes Base64 → creates Aseprite Image → places on canvas
+- Result: Pixel art appears as new layer/frame in user's Aseprite project
+
+The function handles edge cases like:
+- No active sprite (creates new one)
+- Corrupted image data (shows error, doesn't crash)
+- Different color modes (RGB vs RGBA)
+- User-specified output methods (new layer vs new frame)
+
+@param image_data: Table containing AI-generated image information:
+  - base64: Base64-encoded pixel data from server
+  - width: Image width in pixels
+  - height: Image height in pixels  
+  - mode: Color mode ("rgba" for transparency, "rgb" for opaque)
+
+@param output_method: Where to place the image:
+  - "New Layer": Creates new layer in current frame
+  - "New Frame": Creates new frame with new layer
+--]]
 local function place_image_in_aseprite_raw(image_data, output_method)
     local image_mode = (image_data.mode == "rgba") and ColorMode.RGBA or ColorMode.RGB
     
@@ -476,7 +644,7 @@ local function create_main_dialog()
         current_dialog:close() 
     end
     
-    local dlg = Dialog("Local AI Generator blah")
+    local dlg = Dialog("Local AI Generator")
     current_dialog = dlg
     
     -- Server status + debug path

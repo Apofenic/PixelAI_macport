@@ -6,14 +6,27 @@ Original PixelAI for Windows - <https://red335.itch.io/pixelai-local-ai-directly
 
 ## 🚀 Quick Start
 
+### Prerequisites
+
+- **Node.js** (LTS version) - Required for development scripts
+- **Yarn** - Package manager for running development scripts
+- **Python 3.x** - For the AI server backend
+
 ### First-Time Setup
 
 ```bash
-# 1. Install extension for development
-./scripts/dev-sync.sh
+# 1. Install dependencies
+yarn install
 
-# 2. Start the Python server
+# 2. Install extension for development
+./scripts/dev-sync.sh
+# OR use yarn:
+yarn sync
+
+# 3. Start the Python server
 ./start_server.sh
+# OR use yarn:
+yarn start
 ```
 
 ### Daily Development Workflow
@@ -22,12 +35,16 @@ Original PixelAI for Windows - <https://red335.itch.io/pixelai-local-ai-directly
 # Edit Lua files in: aseprite_ext_edit/PixelAI/
 # Then sync changes (~3 seconds):
 ./scripts/dev-sync.sh
+# OR use yarn:
+yarn sync
 ```
 
 ### Building for Distribution
 
 ```bash
 ./scripts/build.sh       # Creates .aseprite-extension package
+# OR use yarn:
+yarn build
 ```
 
 ## 📁 Project Structure
@@ -56,8 +73,8 @@ PixelAI/
 
 - **`./scripts/dev-sync.sh`** - Copies files to Aseprite extensions directory (~3 seconds)
 - **`./scripts/build.sh`** - Creates versioned `.aseprite-extension` packages
-- **`npm run build`** - Alternative build command via npm
-- **`npm run dev:sync`** - Alternative sync command via npm
+- **`yarn build`** - Alternative build command via yarn
+- **`yarn sync`** - Alternative sync command via yarn
 
 ### Development Features
 

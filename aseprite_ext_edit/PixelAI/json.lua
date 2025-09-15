@@ -1,19 +1,63 @@
--- Simple JSON library for Lua
--- Basic JSON encoding/decoding functionality
+--[[
+PixelAI Extension - JSON Library
+================================
+
+A lightweight, self-contained JSON encoding and decoding library for Lua.
+This module provides essential JSON functionality without external dependencies,
+making it perfect for Aseprite extensions.
+
+Features:
+- Complete JSON encoding: strings, numbers, booleans, arrays, objects, null
+- Robust JSON decoding with proper error handling
+- String escaping for special characters (\, ", \n, \r, \t)
+- Array vs object detection for proper JSON structure
+- Recursive encoding/decoding for nested structures
+- Memory-efficient parsing with single-pass algorithms
+
+Purpose:
+Used by the HTTP client to encode request payloads and decode server responses
+for AI image generation API communication.
+
+Standards Compliance:
+- Follows JSON specification (RFC 7159)
+- Handles UTF-8 strings correctly
+- Proper null/boolean/number representations
+- Supports nested objects and arrays of arbitrary depth
+--]]
 
 local json = {}
 
--- Helper function to escape strings
+-- ============================================================================
+-- STRING ENCODING UTILITIES
+-- ============================================================================
+
+--[[
+Escapes special characters in strings for JSON encoding
+Handles backslashes, quotes, and control characters
+
+@param str: String to escape
+@return: Escaped string safe for JSON
+--]]
 local function escape_string(str)
-    str = string.gsub(str, "\\", "\\\\")
-    str = string.gsub(str, '"', '\\"')
-    str = string.gsub(str, "\n", "\\n")
-    str = string.gsub(str, "\r", "\\r")
-    str = string.gsub(str, "\t", "\\t")
+    str = string.gsub(str, "\\", "\\\\")  -- Escape backslashes first
+    str = string.gsub(str, '"', '\\"')    -- Escape double quotes
+    str = string.gsub(str, "\n", "\\n")   -- Escape newlines
+    str = string.gsub(str, "\r", "\\r")   -- Escape carriage returns
+    str = string.gsub(str, "\t", "\\t")   -- Escape tabs
     return str
 end
 
--- Helper function to encode value
+-- ============================================================================
+-- JSON ENCODING FUNCTIONS
+-- ============================================================================
+
+--[[
+Recursively encodes a Lua value as JSON
+Handles all JSON data types and nested structures
+
+@param value: Lua value to encode (any type)
+@return: JSON string representation
+--]]
 local function encode_value(value)
     local value_type = type(value)
     
@@ -26,11 +70,12 @@ local function encode_value(value)
     elseif value_type == "string" then
         return '"' .. escape_string(value) .. '"'
     elseif value_type == "table" then
-        -- Check if it's an array
+        -- Determine if table should be encoded as array or object
         local is_array = true
         local max_index = 0
         local count = 0
         
+        -- Check if all keys are consecutive positive integers
         for k, v in pairs(value) do
             count = count + 1
             if type(k) == "number" and k > 0 and k == math.floor(k) then
@@ -41,8 +86,8 @@ local function encode_value(value)
             end
         end
         
+        -- Encode as JSON array if keys are consecutive integers 1..n
         if is_array and count == max_index then
-            -- Encode as array
             local parts = {}
             for i = 1, max_index do
                 table.insert(parts, encode_value(value[i]))

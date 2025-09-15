@@ -5,8 +5,8 @@
     "scripts": {
         "build": "./scripts/build.sh",
         "build:verbose": "./scripts/build.sh --verbose",
-        "dev:sync": "./scripts/dev-sync.sh",
-        "start:server": "./start_server.sh"
+        "sync": "./scripts/dev-sync.sh",
+        "start": "./start_server.sh"
     },
     "devDependencies": {},
     "repository": {
