@@ -534,6 +534,7 @@ local function open_model_dialog()
     local model_dlg = Dialog("Model Settings")
 
     model_dlg:combobox{
+        enabled = false,
         id = "engine",
         label = "Engine:",
         options = {"torch", "mlx"},

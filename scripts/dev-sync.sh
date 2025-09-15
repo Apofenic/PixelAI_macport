@@ -79,33 +79,74 @@ echo -e "${GREEN}✅ Files synced to Aseprite${NC}"
 # Start Aseprite
 echo -e "${YELLOW}🚀 Starting Aseprite...${NC}"
 
-# Try common Aseprite locations
+# Try common Aseprite locations (in order of preference)
 ASEPRITE_PATHS=(
-    "/Applications/Aseprite.app/Contents/MacOS/aseprite"
     "/Applications/Aseprite.app"
+    "$HOME/Library/Application Support/Steam/steamapps/common/Aseprite/Aseprite.app"
+    "/Applications/Aseprite.app/Contents/MacOS/aseprite"
     "/usr/local/bin/aseprite"
+    "/opt/homebrew/bin/aseprite"
     "$(which aseprite 2>/dev/null || true)"
 )
 
+echo -e "${BLUE}🔍 Searching for Aseprite installation...${NC}"
+
 ASEPRITE_FOUND=false
 for path in "${ASEPRITE_PATHS[@]}"; do
-    if [[ -n "$path" && -e "$path" ]]; then
+    # Skip empty paths
+    if [[ -z "$path" ]]; then
+        continue
+    fi
+    
+    echo -e "${BLUE}   Checking: $path${NC}"
+    
+    if [[ -e "$path" ]]; then
         echo -e "${GREEN}✅ Found Aseprite at: $path${NC}"
         
+        # Use open command for .app bundles, direct execution for binaries
         if [[ "$path" == *.app ]]; then
-            open "$path" > /dev/null 2>&1 &
+            echo -e "${YELLOW}   Launching .app bundle with 'open'...${NC}"
+            if open "$path"; then
+                echo -e "${GREEN}✅ Aseprite launched successfully${NC}"
+                ASEPRITE_FOUND=true
+                break
+            else
+                echo -e "${RED}❌ Failed to launch $path${NC}"
+            fi
         else
+            echo -e "${YELLOW}   Launching binary directly...${NC}"
+            # Start the binary in background and check if it started successfully
             "$path" > /dev/null 2>&1 &
+            local pid=$!
+            sleep 0.5  # Give it a moment to start
+            if kill -0 "$pid" 2>/dev/null; then
+                echo -e "${GREEN}✅ Aseprite launched successfully${NC}"
+                ASEPRITE_FOUND=true
+                break
+            else
+                echo -e "${RED}❌ Failed to launch $path${NC}"
+            fi
         fi
-        
-        ASEPRITE_FOUND=true
-        break
+    else
+        echo -e "${BLUE}   Not found${NC}"
     fi
 done
 
 if [[ "$ASEPRITE_FOUND" == false ]]; then
     echo -e "${RED}❌ Could not find Aseprite installation${NC}"
-    echo -e "${BLUE}💡 Please start Aseprite manually${NC}"
+    echo -e "${BLUE}💡 Tried the following locations:${NC}"
+    for path in "${ASEPRITE_PATHS[@]}"; do
+        if [[ -n "$path" ]]; then
+            echo -e "${BLUE}   - $path${NC}"
+        fi
+    done
+    echo
+    echo -e "${BLUE}💡 Please install Aseprite or start it manually${NC}"
+    echo -e "${BLUE}💡 Common installation methods:${NC}"
+    echo -e "${BLUE}   - Download from https://www.aseprite.org${NC}"
+    echo -e "${BLUE}   - Install via Steam${NC}"
+    echo -e "${BLUE}   - Install via Homebrew: brew install --cask aseprite${NC}"
+    echo
     echo -e "${GREEN}✅ Extension files are ready in Aseprite${NC}"
     exit 1
 fi
