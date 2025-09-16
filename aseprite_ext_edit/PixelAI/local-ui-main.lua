@@ -151,7 +151,13 @@ local quality_presets = {
     {name = "Fast (512x512)", width = 512, height = 512, description = "Faster generation"},
     {name = "High (1024x1024)", width = 1024, height = 1024, description = "Better quality (default)"},
     {name = "Ultra (1536x1536)", width = 1536, height = 1536, description = "Best quality (slow)"},
-    {name = "Max (2048x2048)", width = 2048, height = 2048, description = "Maximum quality (very slow)"}
+    {name = "Max (2048x2048)", width = 2048, height = 2048, description = "Maximum quality (very slow)"},
+    {name = "High (1024x1024)", width = 1024, height = 1024, description = "Better quality (default)"},
+    {name = "Ultra (1536x1536)", width = 1536, height = 1536, description = "Best quality (slow)"},
+    {name = "(848x480)", width = 848, height = 480, description = "16:905 aspect ratio "},
+    {name = "(896x504)", width = 896, height = 504, description = "closest true trained 16:9 aspect to 480p"},
+    {name = "(1024x576)", width = 1024, height = 576, description = "clean 16:9 generation"},
+    {name = "(1600x900)", width = 1600, height = 900, description = "clean 16:9 generation"},
 }
 
 -- Common dimension presets for pixel art
@@ -162,8 +168,17 @@ local dimension_presets = {
     {name = "Large (256x256)", width = 256, height = 256},
     {name = "Portrait (64x96)", width = 64, height = 96},
     {name = "Landscape (96x64)", width = 96, height = 64},
-    {name = "Neo Geo (320x224)", width = 320, height = 224},
-    {name = "Neo Geo 16x9 (400x224)", width = 400, height = 224},
+    {name = "Neo Geo 4:3 (320x224)", width = 320, height = 224},
+    {name = "Neo Geo 16:9 (400x224)", width = 400, height = 224},
+    {name = "VGA 4:3 (320x240)", width = 320, height = 240},
+    {name = "VGA 16:9 (426x240)", width = 426, height = 240},
+    {name = "SVGA 4:3 (640x480)", width = 640, height = 480},
+    {name = "SVGA 16:9 (854x480)", width = 854, height = 480},
+    {name = "to match with generated image (896x504)", width = 896, height = 504 },
+    {name = "clean 1080p scaler (320x180)", width = 320, height = 180},
+    {name = "clean 1080p scaler 2x (640x360)", width = 640, height = 360},
+    {name = "clean 1080p scaler 3x (960x540)", width = 960, height= 540},
+
 }
 
 -- ============================================================================
@@ -409,16 +424,41 @@ The function handles edge cases like:
   - "New Layer": Creates new layer in current frame
   - "New Frame": Creates new frame with new layer
 --]]
-local function place_image_in_aseprite_raw(image_data, output_method)
+-- Places image with optional seed (for naming) and interactive canvas handling
+local function place_image_in_aseprite_raw(image_data, output_method, opts)
+    opts = opts or {}
+    local used_seed = opts.seed
     local image_mode = (image_data.mode == "rgba") and ColorMode.RGBA or ColorMode.RGB
     
-    -- Create new sprite if none exists
-    if not app.activeSprite then
-        app.command.NewFile{
-            width = image_data.width,
-            height = image_data.height,
-            colorMode = image_mode
-        }
+    -- Create new sprite if none exists OR if current sprite dimensions don't match result
+    -- Previous behavior: when a sprite already existed (e.g. 64x64) and a larger image (e.g. 400x224)
+    -- was generated, the code placed the larger image into a cel bound by the smaller canvas, causing
+    -- clipping and giving the impression the generation happened at the smaller size.
+    -- Fix: If dimensions differ, create a new appropriately sized sprite to preserve full output.
+    if app.activeSprite then
+        local sw, sh = app.activeSprite.width, app.activeSprite.height
+        if sw ~= image_data.width or sh ~= image_data.height then
+            -- Offer choice instead of automatic new sprite
+            local choice = app.alert{
+                title = "Canvas Size Mismatch",
+                text = string.format(
+                    "Existing canvas: %dx%d\nGenerated image: %dx%d\nHow would you like to proceed?",
+                    sw, sh, image_data.width, image_data.height
+                ),
+                buttons = {"New Sprite", "Resize", "Cancel"}
+            }
+            if choice == 1 then -- New Sprite
+                app.command.NewFile{width=image_data.width, height=image_data.height, colorMode=image_mode}
+            elseif choice == 2 then -- Resize existing sprite
+                app.transaction("Resize Sprite", function()
+                    app.activeSprite:resize(image_data.width, image_data.height)
+                end)
+            else
+                return -- Cancel placement
+            end
+        end
+    else
+        app.command.NewFile{width=image_data.width, height=image_data.height, colorMode=image_mode}
     end
     
     local cel = prepare_image_for_generation(output_method, image_mode)
@@ -440,6 +480,14 @@ local function place_image_in_aseprite_raw(image_data, output_method)
         if success then
             cel.image:clear()
             cel.image:drawImage(im, Point(0, 0))
+            -- Rename layer with traceability info
+            local layer_suffix_parts = { tostring(image_data.width) .. "x" .. tostring(image_data.height) }
+            if used_seed then table.insert(layer_suffix_parts, "seed:" .. tostring(used_seed)) end
+            if current_settings.colors then table.insert(layer_suffix_parts, tostring(current_settings.colors) .. "c") end
+            local suffix = table.concat(layer_suffix_parts, " | ")
+            if cel.layer then
+                cel.layer.name = "AI Gen " .. suffix
+            end
         else
             app.alert("Failed to process image data.")
         end
@@ -705,11 +753,15 @@ local function create_main_dialog()
                 if preset.name == selected_name then
                     current_settings.pixel_width = preset.width
                     current_settings.pixel_height = preset.height
+                    dlg:modify{ id = "final_size_label", text = string.format("Final Size: %dx%d", preset.width, preset.height) }
                     break
                 end
             end
         end
     }
+
+    -- Display current final pixel output size (helpful confirmation to user)
+    dlg:label{ id = "final_size_label", text = string.format("Final Size: %dx%d", current_settings.pixel_width, current_settings.pixel_height) }
     
     dlg:number{
         id = "colors",
@@ -785,7 +837,16 @@ local function create_main_dialog()
                         app.alert("Generation failed. See server log for details.")
                     end
                 elseif response and response.success and response.image then
-                    place_image_in_aseprite_raw(response.image, current_settings.output_method)
+                    -- Enhancement 1: size verification before placement
+                    local req_w, req_h = current_settings.pixel_width, current_settings.pixel_height
+                    local got_w, got_h = response.image.width, response.image.height
+                    if req_w ~= got_w or req_h ~= got_h then
+                        app.alert(string.format(
+                            "Warning: Requested %dx%d but server returned %dx%d.", req_w, req_h, got_w, got_h
+                        ))
+                    end
+                    -- Place with seed traceability
+                    place_image_in_aseprite_raw(response.image, current_settings.output_method, { seed = response.seed })
                     
                     -- Show used seed but keep -1 for random generations
                     if response.seed and current_settings.seed == -1 then

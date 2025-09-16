@@ -382,12 +382,55 @@ class PixelArtSDServer:
         print(f"🔀 Switched inference engine to: {engine}")
         return True
 
-    def process_for_pixel_art(self, image, target_size=(64, 64), colors=16):
-        """Advanced pixel art post-processing with color quantization."""
-        print(f"🖼️ Processing for pixel art: {target_size}, {colors} colors")
-        
-        # Resize with nearest neighbor for sharp pixels
-        image = image.resize(target_size, Image.NEAREST)
+    def process_for_pixel_art(self, image, target_size=(64, 64), colors=16, preserve_aspect=True, fit_mode="contain", pad_color=(0,0,0,0)):
+        """Advanced pixel art post-processing with optional aspect preservation.
+
+        Args:
+            image (PIL.Image): High-res diffusion output
+            target_size (tuple): (w,h) final pixel art size
+            colors (int): Palette size (<=0 disables quantization)
+            preserve_aspect (bool): If True, avoid stretching original aspect
+            fit_mode (str): One of 'contain', 'cover', 'stretch'
+                contain: letterbox/pad so entire image fits inside target
+                cover: crop after scaling to completely fill target
+                stretch: direct resize (original behavior)
+            pad_color (tuple): RGBA used when padding (contain)
+        """
+        print(f"🖼️ Processing for pixel art: {target_size}, {colors} colors, aspect={preserve_aspect}, fit={fit_mode}")
+
+        tw, th = target_size
+        if preserve_aspect and fit_mode in ("contain", "cover"):
+            ow, oh = image.width, image.height
+            if ow == 0 or oh == 0:
+                preserve_aspect = False
+            else:
+                scale_x = tw / ow
+                scale_y = th / oh
+                if fit_mode == "contain":
+                    scale = min(scale_x, scale_y)
+                else:  # cover
+                    scale = max(scale_x, scale_y)
+                new_w = max(1, int(round(ow * scale)))
+                new_h = max(1, int(round(oh * scale)))
+                image = image.resize((new_w, new_h), Image.NEAREST)
+                # Pad or crop to exact target
+                if fit_mode == "contain":
+                    canvas = Image.new('RGBA', (tw, th), pad_color)
+                    off_x = (tw - new_w) // 2
+                    off_y = (th - new_h) // 2
+                    canvas.paste(image, (off_x, off_y))
+                    image = canvas
+                else:  # cover -> crop center
+                    if new_w > tw or new_h > th:
+                        left = (new_w - tw) // 2
+                        top = (new_h - th) // 2
+                        image = image.crop((left, top, left + tw, top + th))
+                # Ensure final size
+                if image.size != (tw, th):
+                    image = image.resize((tw, th), Image.NEAREST)
+        else:
+            # Stretch (original behavior)
+            image = image.resize(target_size, Image.NEAREST)
         
         # Apply color quantization if specified
         if colors > 0:
@@ -451,10 +494,17 @@ def generate():
         pixel_height = int(data.get('pixel_height', 64))
         colors = int(data.get('colors', 16))
         
+        preserve_aspect = bool(data.get('preserve_aspect', True))
+        fit_mode = data.get('fit_mode', 'contain')
+        if fit_mode not in ['contain', 'cover', 'stretch']:
+            fit_mode = 'contain'
+
         pixel_image = sd_server.process_for_pixel_art(
             image,
             target_size=(pixel_width, pixel_height),
-            colors=colors
+            colors=colors,
+            preserve_aspect=preserve_aspect,
+            fit_mode=fit_mode
         )
         
         # Convert to base64
@@ -469,7 +519,9 @@ def generate():
                 "base64": img_base64,
                 "width": pixel_width,
                 "height": pixel_height,
-                "mode": "rgba"
+                "mode": "rgba",
+                "fit_mode": fit_mode,
+                "preserve_aspect": preserve_aspect
             },
             "seed": used_seed,
             "prompt": prompt,
