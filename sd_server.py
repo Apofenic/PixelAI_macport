@@ -10,7 +10,9 @@ import json
 import base64
 import io
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import threading
+from uuid import UUID, uuid4
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import torch
@@ -37,17 +39,30 @@ CORS(app)
 
 class PixelArtSDServer:
     def __init__(self):
+        # Core pipeline/model state
         self.pipeline = None
         self.segmentation_model = None
         self.segmentation_processor = None
         self.model_loaded = False
         self.current_model = None
-        # Current inference engine: 'torch' (diffusers) or 'mlx' (Apple MLX backend placeholder)
-        self.current_engine = 'torch'
+        self.current_engine = 'torch'  # 'torch' or 'mlx'
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model_cache = {}
         self.offline_mode = False
 
+        # Progress tracking (Task 1.1.1)
+        self.generation_progress = {}
+        self.current_generation_id = None
+        self.progress_lock = threading.RLock()
+        self.progress_retention_seconds = 10
+        self.progress_error_retention_seconds = 30
+        self.enforce_monotonic_progress = True
+        # Cancellation tracking
+        self._cancellation_flags = set()
+        # Expiry / retention enhancements
+        self.expiry_grace_seconds = 5
+
+        # Default generation settings
         self.default_settings = {
             "num_inference_steps": 30,
             "guidance_scale": 7.5,
@@ -55,12 +70,16 @@ class PixelArtSDServer:
             "pixel_art_prompt_suffix": ", pixel art, 8bit style, game sprite"
         }
 
-        print(f"🚀 Local AI Generator Server v2.0")
+        # Startup diagnostics
+        print("🚀 Local AI Generator Server v2.0")
         print(f"📱 Device: {self.device}")
         print(f"🔥 CUDA Available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
             print(f"🎮 GPU: {torch.cuda.get_device_name()}")
             print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+
+class CancelledGeneration(Exception):
+    pass
 
     def load_segmentation_model(self):
         """Loads the BiRefNet model for professional background removal."""
@@ -306,6 +325,191 @@ class PixelArtSDServer:
                 except Exception:
                     pass
 
+    def generate_image_with_progress(self, generation_id: str, prompt, lora_model=None, lora_strength=1.0, progress_phases=None, **kwargs):
+        """Progress-aware generation.
+
+        Emits coarse + step-level progress updates via update_progress.
+        progress_phases (optional) allows overriding default phase percentage milestones.
+        """
+        if not self.model_loaded:
+            raise Exception("No base model loaded. Please load a model first.")
+        if self.current_engine == 'mlx':
+            # Use existing MLX stub (no internal steps yet)
+            img, seed = self.generate_image_mlx(prompt, **kwargs)
+            self.update_progress(generation_id, progress=100.0, status='completed', message='MLX placeholder complete')
+            return img, seed
+
+        # Default phase anchors (will be supplemented by actual diffusion steps later)
+        # Phase anchors limited to those reached during diffusion window (<=75%).
+        # Post-diffusion phases (80,90,95,98) are emitted explicitly after pipeline run.
+        default_phases = progress_phases or [
+            (0.0, 'Initializing'),
+            (10.0, 'Preparing pipeline'),
+            (25.0, 'Encoding prompt'),
+            (40.0, 'Starting diffusion'),
+            (60.0, 'Mid diffusion'),
+            (75.0, 'Finishing diffusion steps'),
+        ]
+
+        total_steps = int(kwargs.get('num_inference_steps', self.default_settings['num_inference_steps']))
+        width = kwargs.get('width')
+        height = kwargs.get('height')
+
+        # Baseline initialization update (settings already included by caller but ensure)
+        self.update_progress(
+            generation_id,
+            message='Starting generation',
+            progress=0.0,
+            width=width,
+            height=height,
+            steps=total_steps,
+            status='generating'
+        )
+
+        import time, math
+        start_monotonic = time.monotonic()
+        step_durations = []
+
+        # Prepare pipeline args similar to generate_image
+        gen_params = self.default_settings.copy()
+        gen_params.update(kwargs)
+        if "width" not in kwargs or "height" not in kwargs:
+            if "xl" in self.current_model.lower():
+                gen_params.setdefault('width', 1024)
+                gen_params.setdefault('height', 1024)
+            else:
+                gen_params.setdefault('width', 512)
+                gen_params.setdefault('height', 512)
+
+        if "pixel art" not in prompt.lower():
+            prompt_eff = prompt + gen_params["pixel_art_prompt_suffix"]
+        else:
+            prompt_eff = prompt
+
+        seed = gen_params.get('seed', -1)
+        generator = torch.Generator(device=self.device)
+        if seed is not None and int(seed) != -1:
+            generator.manual_seed(int(seed))
+        else:
+            import random
+            seed = random.randint(0, 2**32 - 1)
+            generator.manual_seed(seed)
+
+        pipeline_kwargs = {
+            "prompt": prompt_eff,
+            "negative_prompt": gen_params["negative_prompt"],
+            "width": gen_params['width'],
+            "height": gen_params['height'],
+            "num_inference_steps": int(gen_params["num_inference_steps"]),
+            "guidance_scale": float(gen_params["guidance_scale"]),
+            "generator": generator
+        }
+
+        # LoRA handling (duplicated minimal logic; could refactor later)
+        if lora_model and lora_model.lower() not in ['none', '']:
+            try:
+                if os.path.exists(lora_model):
+                    lora_path, weight_name = os.path.split(lora_model)
+                    self.pipeline.load_lora_weights(lora_path, weight_name=weight_name)
+                else:
+                    self.pipeline.load_lora_weights(lora_model)
+                pipeline_kwargs["cross_attention_kwargs"] = {"scale": float(lora_strength)}
+            except Exception as le:
+                msg = str(le)
+                if ("Target modules" in msg or "target modules" in msg or "size mismatch" in msg):
+                    raise Exception("INCOMPATIBLE_LORA")
+                raise
+
+        # Inform about starting diffusion
+        self.update_progress(generation_id, message='Initializing diffusion', progress=5.0)
+
+        # Hook into pipeline progress (diffusers allows callback per step via callback / callback_steps)
+        step_target = int(pipeline_kwargs['num_inference_steps'])
+        phase_iter = iter(default_phases)
+        current_phase = next(phase_iter, None)
+
+        def diffusion_callback(step_idx: int, timestep: int, latents):  # noqa: D401
+            nonlocal current_phase
+            # Cancellation fast-path: check flag early to minimize wasted work
+            with self.progress_lock:
+                if generation_id in self._cancellation_flags:
+                    # Mark canceled if not already terminal
+                    existing = self.generation_progress.get(generation_id)
+                    if existing and existing.get('status') not in ['canceled', 'error', 'completed']:
+                        self.update_progress(
+                            generation_id,
+                            progress=existing.get('progress', 0.0),
+                            status='canceled',
+                            message=f'Canceled at step {step_idx+1}/{step_target}',
+                            current_step=step_idx+1,
+                            total_steps=step_target
+                        )
+                    raise CancelledGeneration(f"Generation {generation_id} canceled")
+            now = time.monotonic()
+            if step_idx > 0:
+                step_durations.append(now - diffusion_callback.last_time)
+            diffusion_callback.last_time = now
+
+            # Compute basic progress proportion for diffusion window (allocate 40% -> 75%)
+            diffusion_start_pct = 40.0
+            diffusion_end_pct = 75.0
+            frac = (step_idx + 1) / step_target
+            diffusion_pct = diffusion_start_pct + (diffusion_end_pct - diffusion_start_pct) * frac
+
+            elapsed = now - start_monotonic
+            spi = None
+            eta_sec = None
+            if len(step_durations) >= 3:
+                spi = sum(step_durations) / len(step_durations)
+                remaining = max(0, step_target - (step_idx + 1))
+                eta_sec = remaining * spi
+
+            # Advance phases if needed
+            while current_phase and diffusion_pct >= current_phase[0]:
+                phase_pct, phase_msg = current_phase
+                self.update_progress(generation_id, progress=phase_pct, message=phase_msg, current_step=step_idx+1, total_steps=step_target)
+                current_phase = next(phase_iter, None)
+
+            self.update_progress(
+                generation_id,
+                progress=diffusion_pct,
+                message=f"Diffusion step {step_idx+1}/{step_target}",
+                current_step=step_idx+1,
+                total_steps=step_target,
+                elapsed_seconds=elapsed,
+                seconds_per_it=spi,
+                eta_seconds=eta_sec
+            )
+
+        diffusion_callback.last_time = time.monotonic()
+
+        try:
+            result = self.pipeline(callback=diffusion_callback, callback_steps=1, **pipeline_kwargs)
+            final_img = result.images[0]
+        except CancelledGeneration:
+            # Propagate after ensuring LoRA unload in finally; caller will handle
+            raise
+        finally:
+            if lora_model and lora_model.lower() not in ['none', ''] and hasattr(self.pipeline, 'unload_lora_weights'):
+                try:
+                    self.pipeline.unload_lora_weights()
+                except Exception:
+                    pass
+
+        # Post-diffusion phase updates (allocate remaining headroom to 98% before final 100%)
+        try:
+            import time
+            end_elapsed = time.monotonic() - start_monotonic
+            # Emit sequential phase transitions with minimal delay to reflect pipeline post-processing
+            self.update_progress(generation_id, progress=80.0, message='Refining latent image', elapsed_seconds=end_elapsed, current_step=step_target, total_steps=step_target)
+            self.update_progress(generation_id, progress=90.0, message='Decoding & post-processing', elapsed_seconds=end_elapsed, current_step=step_target, total_steps=step_target)
+            self.update_progress(generation_id, progress=95.0, message='Finalizing outputs', elapsed_seconds=end_elapsed, current_step=step_target, total_steps=step_target)
+            self.update_progress(generation_id, progress=98.0, message='Preparing result payload', elapsed_seconds=end_elapsed, current_step=step_target, total_steps=step_target)
+        except Exception:
+            pass  # Non-critical
+        # Caller (/generate) will set 100% upon completion of pixel art processing.
+        return final_img, seed
+
     @staticmethod
     def classify_exception(ex: Exception):
         """Return (code, friendly_message) for known generation errors."""
@@ -381,6 +585,129 @@ class PixelArtSDServer:
         self.current_engine = engine
         print(f"🔀 Switched inference engine to: {engine}")
         return True
+
+    # ---------------------- Progress Tracking Core (Tasks 1.2.x) ----------------------
+    def update_progress(self, generation_id: str, **fields):
+        """Thread-safe progress update with monotonic enforcement.
+
+        fields can include: progress(float 0-100), status, message, current_step,
+        total_steps, elapsed_seconds, eta_seconds, seconds_per_it, width, height, steps.
+        """
+        now_dt = datetime.utcnow()
+        iso_now = now_dt.replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z')
+        with self.progress_lock:
+            entry = self.generation_progress.get(generation_id)
+            if not entry:
+                # Initialize entry if absent
+                entry = {
+                    'generation_id': generation_id,
+                    'progress': 0.0,
+                    'status': fields.get('status', 'generating'),
+                    'message': fields.get('message', ''),
+                    'timestamp': iso_now,
+                    'created_at': now_dt,
+                    'updated_at': now_dt,
+                    'current_step': None,
+                    'total_steps': None,
+                    'elapsed_seconds': None,
+                    'eta_seconds': None,
+                    'seconds_per_it': None,
+                    'width': fields.get('width'),
+                    'height': fields.get('height'),
+                    'steps': fields.get('steps'),
+                    'settings_included': bool(fields.get('width') and fields.get('height') and fields.get('steps'))
+                }
+                self.generation_progress[generation_id] = entry
+
+            old_progress = entry.get('progress', 0.0)
+            new_progress = fields.get('progress', old_progress)
+            if self.enforce_monotonic_progress and new_progress < old_progress:
+                new_progress = old_progress
+
+            # Merge allowed scalar fields
+            scalar_keys = [
+                'status','message','current_step','total_steps','elapsed_seconds',
+                'eta_seconds','seconds_per_it','width','height','steps'
+            ]
+            for k in scalar_keys:
+                if k in fields and fields[k] is not None:
+                    entry[k] = fields[k]
+
+            entry['progress'] = float(new_progress)
+            entry['timestamp'] = iso_now
+            entry['updated_at'] = now_dt
+
+            # Terminal status expiry setup
+            if 'status' in fields and fields['status'] in ('completed','error','canceled') and not entry.get('expires_at'):
+                retention = self.progress_retention_seconds
+                if fields['status'] == 'error':
+                    retention = self.progress_error_retention_seconds
+                exp_dt = now_dt + timedelta(seconds=retention)
+                entry['expires_at'] = exp_dt.replace(tzinfo=timezone.utc).isoformat().replace('+00:00','Z')
+                entry['expiry_grace_seconds'] = self.expiry_grace_seconds
+
+            # Logging thresholds
+            log_reason = False
+            if abs(new_progress - old_progress) >= 1.0:
+                log_reason = True
+            if 'status' in fields and fields['status'] != entry.get('status'):
+                log_reason = True
+            if 'message' in fields and fields['message']:
+                # log important milestone messages (diffusion steps, phase changes)
+                if any(keyword in fields['message'].lower() for keyword in ['step', 'phase', 'complete', 'error', 'canceled']):
+                    log_reason = True
+
+            if log_reason:
+                print(f"📊 Progress[{generation_id[:8]}]: {entry['progress']:.1f}% status={entry.get('status')} msg={entry.get('message','')[:60]}")
+
+            return entry.copy()
+
+    def get_progress(self, generation_id: str):
+        """Retrieve a snapshot of progress data (thread-safe). Returns None if not found."""
+        with self.progress_lock:
+            entry = self.generation_progress.get(generation_id)
+            return None if not entry else {k: v for k, v in entry.items() if k not in ('created_at','updated_at')}
+
+    def cleanup_progress(self):
+        """Two-phase expiry:
+        1) After retention -> mark status=expired (if not already)
+        2) After grace -> remove entry
+        """
+        now_dt = datetime.utcnow()
+        removed = []
+        expired_marked = []
+        with self.progress_lock:
+            for gid, entry in list(self.generation_progress.items()):
+                status = entry.get('status')
+                updated_at = entry.get('updated_at') or entry.get('created_at') or now_dt
+                expires_at_iso = entry.get('expires_at')
+                if status in ('completed','error','canceled') and expires_at_iso:
+                    # parse expires_at
+                    try:
+                        from datetime import datetime as _dt
+                        expires_at_dt = _dt.fromisoformat(expires_at_iso.replace('Z','+00:00'))
+                    except Exception:
+                        expires_at_dt = updated_at
+                    if now_dt >= expires_at_dt and status != 'expired':
+                        entry['status'] = 'expired'
+                        entry['timestamp'] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00','Z')
+                        entry['expired_at'] = entry['timestamp']
+                        expired_marked.append(gid)
+                    elif status == 'expired':
+                        # purge after grace
+                        grace = entry.get('expiry_grace_seconds', self.expiry_grace_seconds)
+                        try:
+                            expired_at_dt = _dt.fromisoformat(entry.get('expired_at','').replace('Z','+00:00'))
+                        except Exception:
+                            expired_at_dt = updated_at
+                        if now_dt >= expired_at_dt + timedelta(seconds=grace):
+                            removed.append(gid)
+                            del self.generation_progress[gid]
+        if expired_marked:
+            print(f"⌛ Marked expired: {', '.join(e[:8] for e in expired_marked)}")
+        if removed:
+            print(f"🧹 Purged entries: {', '.join(r[:8] for r in removed)}")
+        return removed
 
     def process_for_pixel_art(self, image, target_size=(64, 64), colors=16, preserve_aspect=True, fit_mode="contain", pad_color=(0,0,0,0)):
         """Advanced pixel art post-processing with optional aspect preservation.
@@ -466,6 +793,15 @@ def generate():
             return jsonify({"success": False, "error": "No prompt provided"}), 400
         
         print(f"\n🎯 New generation request: {prompt[:30]}...")
+        # Concurrency guard (single active generation for now)
+        with sd_server.progress_lock:
+            if sd_server.current_generation_id is not None:
+                return jsonify({
+                    "success": False,
+                    "error": "another generation in progress"
+                }), 409
+            generation_id = str(uuid4())
+            sd_server.current_generation_id = generation_id
         
         # Extract parameters with defaults
         defaults = sd_server.default_settings
@@ -479,10 +815,48 @@ def generate():
             "width": data.get('width', 1024),   # Base generation resolution
             "height": data.get('height', 1024)  # Base generation resolution
         }
+        # Initialize progress entry (0%)
+        sd_server.update_progress(
+            generation_id,
+            progress=0.0,
+            status='generating',
+            message='Initializing generation',
+            width=kwargs['width'],
+            height=kwargs['height'],
+            steps=kwargs['num_inference_steps']
+        )
         
         # Generate the base image
         start_time = datetime.now()
-        image, used_seed = sd_server.generate_image(prompt=prompt, **kwargs)
+        try:
+            if sd_server.current_engine == 'torch':
+                image, used_seed = sd_server.generate_image_with_progress(generation_id, prompt=prompt, **kwargs)
+            else:
+                image, used_seed = sd_server.generate_image(prompt=prompt, **kwargs)
+        except CancelledGeneration as cex:
+            sd_server.update_progress(
+                generation_id,
+                status='canceled',
+                message=str(cex)[:200]
+            )
+            with sd_server.progress_lock:
+                sd_server.current_generation_id = None
+            return jsonify({
+                "success": False,
+                "error": "generation canceled",
+                "code": "CANCELED",
+                "generation_id": generation_id
+            }), 499  # Client Closed Request semantics (non standard)
+        except Exception as gen_ex:
+            # Update progress with error
+            sd_server.update_progress(
+                generation_id,
+                status='error',
+                message=str(gen_ex)[:200]
+            )
+            with sd_server.progress_lock:
+                sd_server.current_generation_id = None
+            raise
         
         # Apply background removal if requested
         if data.get('remove_background', False):
@@ -512,6 +886,26 @@ def generate():
         
         generation_time = (datetime.now() - start_time).total_seconds()
         print(f"⏱️ Total generation time: {generation_time:.2f}s")
+        # Update progress to completed (100%)
+        sd_server.update_progress(
+            generation_id,
+            progress=100.0,
+            status='completed',
+            message='Generation complete'
+        )
+        # Schedule cleanup of current_generation_id and progress retention
+        def _post_cleanup():
+            import time
+            # Quick release to allow a new generation after short grace
+            time.sleep(1)
+            with sd_server.progress_lock:
+                sd_server.current_generation_id = None
+            # Wait remaining retention period before marking expired automatically
+            remaining = max(0, sd_server.progress_retention_seconds - 1)
+            if remaining:
+                time.sleep(remaining)
+            sd_server.cleanup_progress()
+        threading.Thread(target=_post_cleanup, daemon=True).start()
         
         return jsonify({
             "success": True,
@@ -525,7 +919,8 @@ def generate():
             },
             "seed": used_seed,
             "prompt": prompt,
-            "generation_time": generation_time
+            "generation_time": generation_time,
+            "generation_id": generation_id
         })
         
     except Exception as e:
@@ -533,6 +928,16 @@ def generate():
         traceback.print_exc()
         code, friendly = sd_server.classify_exception(e)
         print(f"❌ Generation error [{code}]: {friendly}")
+        # Ensure guard released on errors
+        with sd_server.progress_lock:
+            # Attempt to mark active generation as errored
+            active_id = sd_server.current_generation_id
+            if active_id:
+                try:
+                    sd_server.update_progress(active_id, status='error', message=friendly, progress=100.0 if code == 'OUT_OF_MEMORY' else sd_server.generation_progress.get(active_id, {}).get('progress', 0.0))
+                except Exception:
+                    pass
+            sd_server.current_generation_id = None
         return jsonify({
             "success": False,
             "error": friendly,
@@ -550,6 +955,86 @@ def health_check():
     "engine": sd_server.current_engine,
         "version": "2.0.0"
     })
+
+@app.route('/progress/<generation_id>', methods=['GET'])
+def progress(generation_id):
+    """Progress polling endpoint.
+
+    Returns 200 with progress JSON, 400 for invalid UUID, 404 if not found, 410 if expired.
+    """
+    # UUID validation
+    try:
+        UUID(generation_id)
+    except Exception:
+        return jsonify({"success": False, "error": "invalid id"}), 400
+
+    # Cleanup expired entries opportunistically
+    sd_server.cleanup_progress()
+
+    entry = sd_server.get_progress(generation_id)
+    if not entry:
+        # Could be expired or never existed; we can't fully distinguish without separate tombstone tracking, return 404
+        return jsonify({"success": False, "error": "not found"}), 404
+
+    status = entry.get('status')
+    # Build response mapping
+    resp = {
+        "success": True,
+        "generation_id": entry.get('generation_id'),
+        "progress": entry.get('progress'),
+        "status": status,
+        "message": entry.get('message'),
+        "timestamp": entry.get('timestamp'),
+        "current_step": entry.get('current_step'),
+        "total_steps": entry.get('total_steps'),
+        "elapsed_seconds": entry.get('elapsed_seconds'),
+        "eta_seconds": entry.get('eta_seconds'),
+        "seconds_per_it": entry.get('seconds_per_it'),
+        "width": entry.get('width'),
+        "height": entry.get('height'),
+        "steps": entry.get('steps'),
+        "expires_at": entry.get('expires_at'),
+        "expired_at": entry.get('expired_at')
+    }
+
+    # Future: explicit expired tracking -> 410
+    if status == 'expired':
+        return jsonify({"success": False, "generation_id": entry.get('generation_id'), "status": "expired"}), 410
+
+    return jsonify(resp)
+
+@app.route('/cancel/<generation_id>', methods=['POST'])
+def cancel_generation(generation_id):
+    """Cancellation endpoint.
+
+    Sets a cancellation flag inspected inside the diffusion callback. Returns:
+    202 if cancellation accepted and generation in-progress
+    404 if no such generation exists (never existed or already cleaned)
+    409 if generation already terminal (completed / error / canceled)
+    400 if invalid UUID
+    """
+    # Validate UUID
+    try:
+        UUID(generation_id)
+    except Exception:
+        return jsonify({"success": False, "error": "invalid id"}), 400
+
+    with sd_server.progress_lock:
+        entry = sd_server.generation_progress.get(generation_id)
+        if not entry:
+            return jsonify({"success": False, "error": "not found"}), 404
+        status = entry.get('status')
+        if status in ['completed', 'error', 'canceled', 'expired']:
+            return jsonify({"success": False, "error": f'already {status}'}), 409
+        # Set cancellation flag
+        sd_server._cancellation_flags.add(generation_id)
+        # Optional immediate progress update message (don't change status yet to avoid prematurely terminal state)
+        sd_server.update_progress(generation_id, message='Cancellation requested')
+        return jsonify({
+            "success": True,
+            "generation_id": generation_id,
+            "status": 'canceling'
+        }), 202
 
 @app.route('/load_model', methods=['POST'])
 def load_model_route():
